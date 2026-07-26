@@ -203,10 +203,8 @@ def gif_to_optimized_vector_lottie(gif_path, output_path, target_fps=15, quality
     print(f"Tersimpan   : {output_path}")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Penggunaan: python convert.py <input_gif> [output_json]")
-        sys.exit(1)
-
-    in_file = sys.argv[1]
-    out_file = sys.argv[2] if len(sys.argv) > 2 else "output.json"
-    gif_to_optimized_vector_lottie(in_file, out_file)
+    in_file = sys.argv[1] if len(sys.argv) > 1 else "inputs/input.gif"
+    out_file = sys.argv[2] if len(sys.argv) > 2 else "outputs/vector_output.json"
+    fps = int(sys.argv[3]) if len(sys.argv) > 3 else 16
+    qual = sys.argv[4] if len(sys.argv) > 4 else 'low'
+    gif_to_optimized_vector_lottie(in_file, out_file, fps, qual)
