@@ -29,7 +29,7 @@ def simplify_shapes(shapes):
             uniq.append(s)
     return uniq
 
-def gif_to_optimized_vector_lottie(gif_path, output_path, target_fps=12, quality='low'):
+def gif_to_optimized_vector_lottie(gif_path, output_path, target_fps=15, quality='low'):
     if not os.path.exists(gif_path):
         print(f"Error: File '{gif_path}' tidak ditemukan!")
         sys.exit(1)
