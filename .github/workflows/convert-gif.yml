@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'inputs/**' # Otomatis jalan saat ada file baru di folder inputs/
+      - 'convert.py'
   workflow_dispatch: # Memungkinkan untuk trigger tombol 'Run workflow' secara manual di GitHub
 
 jobs:
