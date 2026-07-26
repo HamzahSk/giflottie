@@ -10,12 +10,32 @@ from lottie import objects
 from lottie.importers.svg import import_svg
 from lottie.exporters.core import export_lottie
 
+def remove_gray_background(frame, lower_gray=np.array([180, 180, 180]), upper_gray=np.array([235, 235, 235])):
+    """
+    Menghapus background abu-abu dan menjadikannya transparan (BGRA).
+    Sesuaikan rentang lower_gray dan upper_gray jika warna abu-abu di GIF sedikit berbeda.
+    """
+    # Pastikan frame berformat RGBA atau BGRA
+    if frame.shape[2] == 3:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+    elif frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGRA)
+
+    # Deteksi piksel dalam rentang warna abu-abu
+    # (Di BGR, warna abu-abu memiliki nilai B, G, R yang relatif seimbang/sama)
+    mask = cv2.inRange(frame[:, :, :3], lower_gray, upper_gray)
+
+    # Buat channel Alpha (transparansi) menjadi 0 untuk area background abu-abu
+    frame[mask > 0, 3] = 0
+
+    return frame
+
 def frames_are_similar(f1, f2, threshold=0.98):
     """Cek kesamaan frame menggunakan template matching (grayscale)."""
     if f1.shape != f2.shape:
         return False
-    g1 = cv2.cvtColor(f1, cv2.COLOR_RGBA2GRAY)
-    g2 = cv2.cvtColor(f2, cv2.COLOR_RGBA2GRAY)
+    g1 = cv2.cvtColor(f1, cv2.COLOR_BGRA2GRAY) if f1.shape[2] == 4 else cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(f2, cv2.COLOR_BGRA2GRAY) if f2.shape[2] == 4 else cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
     return cv2.matchTemplate(g1, g2, cv2.TM_CCOEFF_NORMED)[0][0] >= threshold
 
 def simplify_shapes(shapes):
@@ -41,85 +61,111 @@ def gif_to_optimized_vector_lottie(gif_path, output_path, target_fps=15, quality
         ok, frame = cap.read()
         if not ok:
             break
-        frames_raw.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA))
+        
+        # --- PRE-PROCESSING: Hapus Background Abu-abu ---
+        frame_no_bg = remove_gray_background(frame)
+        frames_raw.append(frame_no_bg)
+        
     cap.release()
 
-    # Durasi tiap frame (ms)
-    pil_gif = Image.open(gif_path)
-    durations = []
-    for i in range(len(frames_raw)):
-        pil_gif.seek(i)
-        durations.append(pil_gif.info.get('duration', 100))
+    if not frames_raw:
+        print("Error: Tidak ada frame yang terbaca dari GIF!")
+        sys.exit(1)
 
-    total = len(frames_raw)
-    print(f"Total frame asli: {total}")
+    h, w, _ = frames_raw[0].shape
+    print(f"Total frame awal: {len(frames_raw)}, Ukuran: {w}x{h}")
 
-    # --- Deteksi frame unik ---
-    unique_frames = []
-    frame_map = []  # indeks asli -> indeks unik
-    for f in frames_raw:
-        found = False
-        for j, uf in enumerate(unique_frames):
-            if frames_are_similar(f, uf):
-                frame_map.append(j)
-                found = True
-                break
-        if not found:
+    # Deduplikasi frame yang mirip
+    print("Menghapus frame duplikat...")
+    unique_frames = [frames_raw[0]]
+    for f in frames_raw[1:]:
+        if not frames_are_similar(unique_frames[-1], f):
             unique_frames.append(f)
-            frame_map.append(len(unique_frames) - 1)
-    print(f"Frame unik: {len(unique_frames)} (hemat {total - len(unique_frames)})")
 
-    # --- Konfigurasi vtracer ---
-    vt_config = {
-        'low':    {'filter_speckle': 10, 'mode': 'polygon'},
-        'medium': {'filter_speckle': 5,  'mode': 'spline'},
-        'high':   {'filter_speckle': 2,  'mode': 'spline'}
-    }.get(quality, {'filter_speckle': 5, 'mode': 'spline'})
+    print(f"Frame tersisa setelah deduplikasi: {len(unique_frames)}")
 
-    # --- Proses tracing hanya untuk frame unik ---
-    lottie_shapes_per_unique = []  # list of list of shapes
-    with tempfile.TemporaryDirectory() as tmp:
-        for idx, frame in enumerate(unique_frames):
-            png_path = os.path.join(tmp, f"u{idx}.png")
-            svg_path = os.path.join(tmp, f"u{idx}.svg")
-            Image.fromarray(frame).save(png_path, "PNG", optimize=True)
+    # Parameter vtracer berdasarkan quality
+    vtracer_opts = {
+        'low': {'colormode': 'color', 'hierarchical': 'stacked', 'filter_speckle': 8, 'color_precision': 6, 'layer_difference': 16, 'corner_threshold': 60, 'length_threshold': 4.0, 'max_iterations': 10, 'splice_threshold': 45, 'path_precision': 3},
+        'medium': {'colormode': 'color', 'hierarchical': 'stacked', 'filter_speckle': 4, 'color_precision': 7, 'layer_difference': 12, 'corner_threshold': 45, 'length_threshold': 3.0, 'max_iterations': 10, 'splice_threshold': 45, 'path_precision': 5},
+        'high': {'colormode': 'color', 'hierarchical': 'stacked', 'filter_speckle': 2, 'color_precision': 8, 'layer_difference': 8, 'corner_threshold': 30, 'length_threshold': 2.0, 'max_iterations': 10, 'splice_threshold': 45, 'path_precision': 8}
+    }
+    opts = vtracer_opts.get(quality, vtracer_opts['low'])
 
+    # Vektorisasi tiap frame unik ke Lottie shapes
+    print("Mengonversi frame ke bentuk vektor (SVG -> Lottie)...")
+    lottie_shapes_per_unique = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for idx, uframe in enumerate(unique_frames):
+            # Frame disimpen sebagai PNG transparan
+            png_path = os.path.join(tmpdir, f"frame_{idx}.png")
+            svg_path = os.path.join(tmpdir, f"frame_{idx}.svg")
+
+            # Ubah BGRA ke RGBA untuk disimpan oleh PIL Image
+            frame_rgba = cv2.cvtColor(uframe, cv2.COLOR_BGRA2RGBA)
+            Image.fromarray(frame_rgba).save(png_path)
+
+            # Konversi ke SVG
             vtracer.convert_image_to_svg_py(
-                png_path, svg_path,
-                colormode="color",
-                mode=vt_config['mode'],
-                hierarchical="stacked",
-                filter_speckle=vt_config['filter_speckle']
+                png_path,
+                svg_path,
+                colormode=opts['colormode'],
+                hierarchical=opts['hierarchical'],
+                filter_speckle=opts['filter_speckle'],
+                color_precision=opts['color_precision'],
+                layer_difference=opts['layer_difference'],
+                corner_threshold=opts['corner_threshold'],
+                length_threshold=opts['length_threshold'],
+                max_iterations=opts['max_iterations'],
+                splice_threshold=opts['splice_threshold'],
+                path_precision=opts['path_precision']
             )
 
-            anim = import_svg(svg_path)
+            # Import SVG ke Lottie Animation
+            lottie_anim = import_svg(svg_path)
             shapes = []
-            for lay in anim.layers:
-                if isinstance(lay, objects.ShapeLayer):
-                    shapes.extend(lay.shapes)
-            lottie_shapes_per_unique.append(simplify_shapes(shapes))
-            print(f"Tracing frame unik {idx+1}/{len(unique_frames)} selesai")
+            for layer in lottie_anim.layers:
+                if hasattr(layer, 'shapes'):
+                    shapes.extend(layer.shapes)
 
-    # --- Bangun animasi Lottie ---
-    anim = objects.Animation(0, target_fps)
-    anim.width, anim.height = frames_raw[0].shape[1], frames_raw[0].shape[0]
-    anim.name = "Optimized Lottie"
+            # Simplifikasi shape
+            shapes = simplify_shapes(shapes)
+            lottie_shapes_per_unique.append(shapes)
 
-    # Timeline dengan frame skipping sesuai FPS
-    frame_interval = 1000.0 / target_fps
-    time_cursor = 0.0
-    next_trigger = 0.0
+    # Buat Struktur Animasi Lottie Utama
+    print("Membangun struktur animasi Lottie...")
+    anim = objects.Animation()
+    anim.width = w
+    anim.height = h
+    anim.frame_rate = target_fps
 
-    current_layer = None        # layer yang sedang "dibuka"
-    current_unique_idx = None   # indeks unik dari layer tsb
-    lottie_time = 0             # frame Lottie saat ini
+    # Mapping frame raw ke index frame unik
+    frame_to_unique_idx = []
+    current_uid = 0
+    frame_to_unique_idx.append(0)
 
-    for i in range(total):
-        time_cursor += durations[i]
-        if time_cursor >= next_trigger:
-            uid = frame_map[i]
-            # Jika frame unik sama dengan sebelumnya, cukup perpanjang durasi layer
+    for i in range(1, len(frames_raw)):
+        if not frames_are_similar(frames_raw[i-1], frames_raw[i]):
+            current_uid += 1
+        frame_to_unique_idx.append(current_uid)
+
+    # Susun timeline Lottie
+    src_fps = target_fps
+    frame_interval = max(1, int(round(src_fps / target_fps)))
+
+    lottie_time = 0
+    next_trigger = 0
+
+    current_layer = None
+    current_unique_idx = -1
+
+    for idx, raw_frame in enumerate(frames_raw):
+        if idx >= next_trigger:
+            uid = frame_to_unique_idx[idx]
+
             if uid == current_unique_idx and current_layer is not None:
+                # Perpanjang durasi layer yang ada
                 current_layer.out_point = lottie_time + 1
             else:
                 # Buat layer baru
@@ -127,7 +173,8 @@ def gif_to_optimized_vector_lottie(gif_path, output_path, target_fps=15, quality
                 layer.name = f"F{len(anim.layers)}"
                 layer.in_point = lottie_time
                 layer.out_point = lottie_time + 1
-                # isi shapes (clone)
+                
+                # Isi shapes (clone)
                 for s in lottie_shapes_per_unique[uid]:
                     layer.add_shape(s.clone())
                 anim.add_layer(layer)
@@ -139,7 +186,7 @@ def gif_to_optimized_vector_lottie(gif_path, output_path, target_fps=15, quality
 
     anim.out_point = lottie_time
 
-    # Simpan
+    # Simpan File Lottie JSON
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     export_lottie(anim, output_path)
 
@@ -156,8 +203,10 @@ def gif_to_optimized_vector_lottie(gif_path, output_path, target_fps=15, quality
     print(f"Tersimpan   : {output_path}")
 
 if __name__ == "__main__":
-    in_file = sys.argv[1] if len(sys.argv) > 1 else "inputs/input.gif"
-    out_file = sys.argv[2] if len(sys.argv) > 2 else "outputs/vector_output.json"
-    fps = int(sys.argv[3]) if len(sys.argv) > 3 else 12
-    qual = sys.argv[4] if len(sys.argv) > 4 else 'low'
-    gif_to_optimized_vector_lottie(in_file, out_file, fps, qual)
+    if len(sys.argv) < 2:
+        print("Penggunaan: python convert.py <input_gif> [output_json]")
+        sys.exit(1)
+
+    in_file = sys.argv[1]
+    out_file = sys.argv[2] if len(sys.argv) > 2 else "output.json"
+    gif_to_optimized_vector_lottie(in_file, out_file)
