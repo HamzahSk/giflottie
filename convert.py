@@ -1,107 +1,87 @@
-import sys
 import os
-import cv2
-import numpy as np
+import sys
+import tempfile
+import vtracer
 from PIL import Image
-
-# Import library pembuat Lottie
 from lottie import objects
+from lottie.importers.svg import import_svg
 from lottie.exporters.core import export_lottie
-from lottie.utils.color import Color
-from lottie.objects.bezier import Bezier
 
-def extract_contours(image_frame, simplify_tolerance=1.5):
-    """Mengekstrak kontur dari transparansi menggunakan OpenCV"""
-    np_image = np.array(image_frame)
-    
-    # Pisahkan Alpha Channel (Transparansi)
-    if np_image.shape[2] == 4:
-        mask = np_image[:, :, 3]
-    else:
-        mask = cv2.cvtColor(np_image, cv2.COLOR_RGBA2GRAY)
-        
-    _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    shapes = []
-    for contour in contours:
-        epsilon = simplify_tolerance * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        
-        if len(approx) < 3:
-            continue
-            
-        vertices = []
-        for point in approx:
-            x, y = point[0]
-            vertices.append((float(x), float(y)))
-            
-        shapes.append(vertices)
-    return shapes
-
-def gif_to_accurate_lottie(gif_path, output_path, fps=30):
+def gif_to_true_vector_lottie(gif_path, output_path, fps=30):
     if not os.path.exists(gif_path):
         print(f"Error: File '{gif_path}' tidak ditemukan!")
         sys.exit(1)
 
+    print("Membaca file GIF...")
     gif = Image.open(gif_path)
     width, height = gif.size
     
-    print(f"Memproses {gif_path} menjadi Lottie dengan library...")
-    
-    frames_shapes = []
-    try:
-        while True:
-            frame = gif.convert("RGBA")
-            shapes = extract_contours(frame)
-            frames_shapes.append(shapes)
-            gif.seek(gif.tell() + 1)
-    except EOFError:
-        pass
-
-    total_frames = len(frames_shapes)
-    
-    # --- Inisialisasi Objek Animasi Lottie ---
-    # Library Lottie akan mengurus struktur dasar JSON secara otomatis
-    animation = objects.Animation(total_frames, fps)
+    # Inisialisasi kerangka Lottie
+    animation = objects.Animation(0, fps)
     animation.width = width
     animation.height = height
-    animation.name = "Accurate Vectorized Lottie"
+    animation.name = "Auto-Traced Vector Lottie"
+    
+    frame_count = 0
+    
+    # Menggunakan temporary directory agar tidak nyampah file PNG/SVG di folder repo
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            while True:
+                print(f"Proses vektorisasi Frame {frame_count}...")
+                
+                # 1. Ambil frame transparan dan simpan sebagai PNG sementara
+                frame_img = gif.convert("RGBA")
+                png_path = os.path.join(temp_dir, f"frame_{frame_count}.png")
+                svg_path = os.path.join(temp_dir, f"frame_{frame_count}.svg")
+                frame_img.save(png_path, format="PNG")
+                
+                # 2. Lakukan Auto-Tracing PNG ke SVG menggunakan vtracer
+                vtracer.convert_image_to_svg_py(
+                    png_path,
+                    svg_path,
+                    colormode="color",         # Mendeteksi warna asli
+                    mode="spline",             # Membuat garis kurva Bezier halus
+                    hierarchical="stacked",    # Menumpuk warna agar rapi
+                    filter_speckle=4,          # Menghilangkan noise piksel kecil
+                    # Parameter penting untuk transparansi:
+                    # vtracer otomatis menghiraukan piksel transparan pada RGBA
+                )
+                
+                # 3. Import hasil SVG dan terjemahkan ke objek Lottie
+                svg_anim = import_svg(svg_path)
+                
+                # 4. Buat Layer baru di Lottie utama untuk frame ini
+                frame_layer = animation.add_layer(objects.ShapeLayer())
+                frame_layer.name = f"Frame {frame_count}"
+                
+                # Atur durasi tampil frame (Sequencing)
+                frame_layer.in_point = frame_count
+                frame_layer.out_point = frame_count + 1
+                
+                # 5. Pindahkan bentuk matematika (Shapes) dari SVG ke Layer Lottie
+                for svg_layer in svg_anim.layers:
+                    if isinstance(svg_layer, objects.ShapeLayer):
+                        for shape in svg_layer.shapes:
+                            frame_layer.add_shape(shape)
+                
+                frame_count += 1
+                gif.seek(gif.tell() + 1)
+                
+        except EOFError:
+            pass # Selesai membaca semua frame
 
-    # --- Menyusun Frame ke dalam Shape Layers ---
-    for i, shapes in enumerate(frames_shapes):
-        # Buat layer baru untuk setiap frame
-        layer = animation.add_layer(objects.ShapeLayer())
-        layer.name = f"Frame {i}"
-        
-        # Atur kapan frame ini muncul dan menghilang
-        layer.in_point = i
-        layer.out_point = i + 1
-        
-        # Masukkan semua bentuk vektor ke dalam layer ini
-        for shape_vertices in shapes:
-            group = layer.add_shape(objects.Group())
-            
-            # Buat kurva Bezier (Poligon tertutup)
-            bezier = Bezier()
-            for x, y in shape_vertices:
-                bezier.add_point(objects.NVector(x, y))
-            bezier.close()
-            
-            # Tambahkan Path
-            path = group.add_shape(objects.Path())
-            path.shape.value = bezier
-            
-            # Tambahkan Fill Color (Warna isi: Hitam pekat)
-            # Kamu bisa mengubah RGB-nya di sini (skala 0-1)
-            group.add_shape(objects.Fill(Color(0, 0, 0)))
+    # Update total durasi animasi
+    animation.out_point = frame_count
 
-    # --- Ekspor ke JSON ---
+    # Simpan hasil akhir ke file JSON
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    print(f"Menyusun dan menyimpan Lottie JSON (Total {frame_count} frame)...")
     export_lottie(animation, output_path)
-    print(f"Sukses! Lottie JSON akurat tersimpan di: {output_path}")
+    
+    print(f"Sukses! True Vector Lottie tersimpan di: {output_path}")
 
 if __name__ == "__main__":
     input_file = sys.argv[1] if len(sys.argv) > 1 else "inputs/input.gif"
     output_file = sys.argv[2] if len(sys.argv) > 2 else "outputs/vector_output.json"
-    gif_to_accurate_lottie(input_file, output_file)
+    gif_to_true_vector_lottie(input_file, output_file)
